@@ -1,15 +1,20 @@
 package pop
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 
 	"github.com/babylonlabs-io/babylon/crypto/bip322"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/urfave/cli"
@@ -17,9 +22,7 @@ import (
 	"github.com/babylonlabs-io/btc-staker/babylonclient/keyringcontroller"
 	"github.com/babylonlabs-io/btc-staker/cmd/stakercli/helpers"
 	"github.com/babylonlabs-io/btc-staker/staker"
-	"github.com/babylonlabs-io/btc-staker/types"
 	ut "github.com/babylonlabs-io/btc-staker/utils"
-	"github.com/babylonlabs-io/btc-staker/walletcontroller"
 )
 
 const (
@@ -58,11 +61,6 @@ var GenerateCreatePopCmd = cli.Command{
 	Usage:     "stakercli pop generate-create-pop",
 	Flags: []cli.Flag{
 		cli.StringFlag{
-			Name:     btcAddressFlag,
-			Usage:    "Bitcoin address to generate proof of possession for",
-			Required: true,
-		},
-		cli.StringFlag{
 			Name:     babyAddressFlag,
 			Usage:    "Baby address to generate proof of possession for",
 			Required: true,
@@ -78,29 +76,13 @@ var GenerateCreatePopCmd = cli.Command{
 			Value: "testnet3",
 		},
 		cli.StringFlag{
-			Name:  btcWalletHostFlag,
-			Usage: "Bitcoin wallet rpc host",
-			Value: "127.0.0.1:18554",
+			Name:  "btc-signature",
+			Usage: "Base64-encoded Schnorr signature of the Babylon address. If not provided, the tool will print the data to be signed and exit.",
 		},
 		cli.StringFlag{
-			Name:  btcWalletRPCUserFlag,
-			Usage: "Bitcoin wallet rpc user",
-			Value: "user",
-		},
-		cli.StringFlag{
-			Name:  btcWalletRPCPassFlag,
-			Usage: "Bitcoin wallet rpc password",
-			Value: "pass",
-		},
-		cli.StringFlag{
-			Name:  btcWalletNameFlag,
-			Usage: "Bitcoin wallet name",
-			Value: "",
-		},
-		cli.StringFlag{
-			Name:  btcWalletPassphraseFlag,
-			Usage: "Bitcoin wallet passphrase",
-			Value: "passphrase",
+			Name:     "btc-pubkey",
+			Usage:    "Hex-encoded 32-byte X-only Bitcoin public key. Required for both signing and verification.",
+			Required: true,
 		},
 		cli.StringFlag{
 			Name:  keyringDirFlag,
@@ -129,27 +111,34 @@ func generatePop(c *cli.Context) error {
 		return err
 	}
 
-	rpcWalletController, err := walletcontroller.NewRPCWalletControllerFromArgs(
-		c.String(btcWalletHostFlag),
-		c.String(btcWalletRPCUserFlag),
-		c.String(btcWalletRPCPassFlag),
-		network,
-		c.String(btcWalletNameFlag),
-		c.String(btcWalletPassphraseFlag),
-		types.BitcoindWalletBackend,
-		networkParams,
-		true,
-		"",
-		"",
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create rpc wallet controller: %w", err)
+	// Get BTC pubkey and convert to P2TR address
+	btcPubKeyHex := c.String("btc-pubkey")
+	if btcPubKeyHex == "" {
+		return fmt.Errorf("btc-pubkey is required")
 	}
 
-	btcAddress, err := btcutil.DecodeAddress(c.String(btcAddressFlag), networkParams)
+	btcPubKeyBytes, err := hex.DecodeString(btcPubKeyHex)
 	if err != nil {
-		return fmt.Errorf("failed to decode bitcoin address: %w", err)
+		return fmt.Errorf("failed to decode Bitcoin public key: %w", err)
 	}
+
+	// Only accept 32-byte X-only public keys
+	if len(btcPubKeyBytes) != 32 {
+		return fmt.Errorf("invalid public key format: only 32-byte X-only public keys are supported")
+	}
+
+	// Create Taproot key and address
+	internalKey, err := schnorr.ParsePubKey(btcPubKeyBytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse Bitcoin public key from X-only key: %w", err)
+	}
+	btcAddress, err := btcutil.NewAddressTaproot(schnorr.SerializePubKey(internalKey), networkParams)
+	if err != nil {
+		return fmt.Errorf("failed to create Taproot address from public key: %w", err)
+	}
+
+	// Store the btcPubKey for later use
+	btcPubKey := internalKey
 
 	babylonAddress := c.String(babyAddressFlag)
 	babyAddressPrefix := c.String(babyAddressPrefixFlag)
@@ -169,11 +158,119 @@ func generatePop(c *cli.Context) error {
 		return err
 	}
 
-	popCreator := staker.NewPopCreator(rpcWalletController, keyring)
-
-	popResponse, err := popCreator.CreatePop(btcAddress, babyAddressPrefix, sdkAddress)
+	record, babyPubKey, err := staker.GetBabyPubKey(keyring, sdkAddress)
 	if err != nil {
 		return err
+	}
+
+	// Prepare BIP322 transaction data to be signed
+	bech32cosmosAddressString, err := sdk.Bech32ifyAddressBytes(babyAddressPrefix, sdkAddress.Bytes())
+	if err != nil {
+		return fmt.Errorf("failed to get babylon address bytes: %w", err)
+	}
+
+	// The message we want to sign is the normalized babylon address
+	msg := []byte(bech32cosmosAddressString)
+
+	// Create a BIP322 toSpend tx
+	toSpendTx, err := bip322.GetToSpendTx(msg, btcAddress)
+	if err != nil {
+		return fmt.Errorf("failed to create BIP322 toSpend transaction: %w", err)
+	}
+
+	// Get the toSign tx that will be signed
+	toSignTx := bip322.GetToSignTx(toSpendTx)
+
+	// If no BTC signature is provided, print the data to be signed and exit
+	btcSignature := c.String("btc-signature")
+	if btcSignature == "" {
+		// Prepare fetcher for signature hash
+		fetcher := txscript.NewCannedPrevOutputFetcher(
+			toSpendTx.TxOut[0].PkScript, 0,
+		)
+
+		// Create sig hash cache
+		hashCache := txscript.NewTxSigHashes(toSignTx, fetcher)
+
+		// For P2TR, use SigHashDefault signature type
+		sigHash, err := txscript.CalcTaprootSignatureHash(
+			hashCache,
+			txscript.SigHashDefault,
+			toSignTx,
+			0,
+			fetcher,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to calculate witness signature hash: %w", err)
+		}
+
+		// Prepare instructions with BIP322 info
+		fmt.Println("Message to be signed (normalized Babylon address):")
+		fmt.Println(bech32cosmosAddressString)
+		fmt.Println("\nDerived Bitcoin address:")
+		fmt.Println(btcAddress.String())
+		fmt.Println("\nSignature hash to be signed (base64) (COPY THIS AND SIGN IT):")
+		fmt.Println(base64.StdEncoding.EncodeToString(sigHash))
+		fmt.Println("\nAfter signing this hash with your Schnorr private key:")
+		fmt.Println("Pass back the base64-encoded Schnorr signature with --btc-signature flag")
+		return nil
+	}
+
+	// Decode the signature
+	btcSignatureBytes, err := base64.StdEncoding.DecodeString(btcSignature)
+	if err != nil {
+		return fmt.Errorf("failed to decode base64 signature: %w", err)
+	}
+
+	// Parse the signature as Schnorr
+	schnorrSignature, err := schnorr.ParseSignature(btcSignatureBytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse Schnorr signature: %w", err)
+	}
+
+	// Create a BIP322 witness with Schnorr signature
+	witness := wire.TxWitness{
+		schnorrSignature.Serialize(), // Schnorr signature
+	}
+	toSignTx.TxIn[0].Witness = witness
+
+	// Serialize the signed transaction
+	var buf bytes.Buffer
+	if err := toSignTx.Serialize(&buf); err != nil {
+		return fmt.Errorf("failed to serialize signed transaction: %w", err)
+	}
+
+	serializedTx, err := bip322.SerializeWitness(witness)
+	if err != nil {
+		return fmt.Errorf("failed to serialize witness: %w", err)
+	}
+
+	// Base64 encode the serialized transaction
+	btcSignBabyEncoded := base64.StdEncoding.EncodeToString(serializedTx)
+
+	if err := bip322.Verify(msg, witness, btcAddress, networkParams); err != nil {
+		return fmt.Errorf("invalid BIP322 signature: %w", err)
+	}
+
+	// If we got here, the signature is valid. Continue with creating the POP
+	babySignBTCAddress, err := staker.SignCosmosAdr36(
+		keyring,
+		record.Name,
+		babylonAddress,
+		[]byte(btcAddress.String()),
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to sign btc address: %w", err)
+	}
+
+	popResponse := &staker.Response{
+		BabyAddress:   babylonAddress,
+		BTCAddress:    btcAddress.String(),
+		BTCPublicKey:  hex.EncodeToString(btcPubKey.SerializeCompressed()[1:]),
+		BTCSignBaby:   btcSignBabyEncoded,
+		BabySignBTC:   base64.StdEncoding.EncodeToString(babySignBTCAddress),
+		BabyPublicKey: base64.StdEncoding.EncodeToString(babyPubKey.Bytes()),
 	}
 
 	if outputPath := c.String(outputFileFlag); outputPath != "" {
@@ -282,16 +379,29 @@ func ValidateBTCSignBaby(btcAddr, babyAddr, btcSignBaby, babyPrefix string, btcN
 		return fmt.Errorf("failed to get babylon address bytes: %w", err)
 	}
 
-	schnorrSigBase64, err := base64.StdEncoding.DecodeString(btcSignBaby)
+	// Try to decode signature as base64
+	sigBytes, err := base64.StdEncoding.DecodeString(btcSignBaby)
 	if err != nil {
-		return fmt.Errorf("failed to decode btcSignBaby: %w", err)
+		// If base64 decoding fails, try hex as fallback for backward compatibility
+		sigBytes, err = hex.DecodeString(btcSignBaby)
+		if err != nil {
+			return fmt.Errorf("failed to decode btcSignBaby (tried both base64 and hex): %w", err)
+		}
 	}
 
-	witness, err := bip322.SimpleSigToWitness(schnorrSigBase64)
+	// Parse the signature as Schnorr
+	signature, err := schnorr.ParseSignature(sigBytes)
 	if err != nil {
-		return fmt.Errorf("failed to convert btcSignBaby to witness: %w", err)
+		return fmt.Errorf("failed to parse as Schnorr signature: %w", err)
 	}
 
+	// Create a proper BIP322 witness
+	witness := wire.TxWitness{
+		signature.Serialize(), // Schnorr signature
+		{},                    // Empty control block for Taproot key path spending
+	}
+
+	// Verify the signature
 	return bip322.Verify(
 		[]byte(bech32cosmosAddressString),
 		witness,
@@ -301,7 +411,7 @@ func ValidateBTCSignBaby(btcAddr, babyAddr, btcSignBaby, babyPrefix string, btcN
 }
 
 func ValidateBabySignBTC(babyPk, babyAddr, btcAddress, babySigOverBTCPk string) error {
-	babyPubKeyBz, err := base64.StdEncoding.DecodeString(babyPk)
+	babyPubKeyBz, err := hex.DecodeString(babyPk)
 	if err != nil {
 		return fmt.Errorf("failed to decode babyPublicKey: %w", err)
 	}
@@ -311,8 +421,8 @@ func ValidateBabySignBTC(babyPk, babyAddr, btcAddress, babySigOverBTCPk string) 
 	}
 
 	babySignBTC := []byte(btcAddress)
-	base64Bytes := base64.StdEncoding.EncodeToString(babySignBTC)
-	babySignBtcDoc := staker.NewCosmosSignDoc(babyAddr, base64Bytes)
+	hexBytes := hex.EncodeToString(babySignBTC)
+	babySignBtcDoc := staker.NewCosmosSignDoc(babyAddr, hexBytes)
 	babySignBtcMarshaled, err := json.Marshal(babySignBtcDoc)
 	if err != nil {
 		return fmt.Errorf("failed to marshalling cosmos sign doc: %w", err)
@@ -320,12 +430,12 @@ func ValidateBabySignBTC(babyPk, babyAddr, btcAddress, babySigOverBTCPk string) 
 
 	babySignBtcBz := sdk.MustSortJSON(babySignBtcMarshaled)
 
-	secp256SigBase64, err := base64.StdEncoding.DecodeString(babySigOverBTCPk)
+	secp256SigHex, err := hex.DecodeString(babySigOverBTCPk)
 	if err != nil {
 		return fmt.Errorf("failed to decode babySignBTC: %w", err)
 	}
 
-	if !babyPubKey.VerifySignature(babySignBtcBz, secp256SigBase64) {
+	if !babyPubKey.VerifySignature(babySignBtcBz, secp256SigHex) {
 		return fmt.Errorf("invalid babySignBtc")
 	}
 
@@ -440,8 +550,8 @@ func generateDeletePop(c *cli.Context) error {
 
 	payload := DeletePopPayload{
 		BabyAddress:   sdkAddress.String(),
-		BabySignature: base64.StdEncoding.EncodeToString(signature),
-		BabyPublicKey: base64.StdEncoding.EncodeToString(babyPubKey.Bytes()),
+		BabySignature: hex.EncodeToString(signature),
+		BabyPublicKey: hex.EncodeToString(babyPubKey.Bytes()),
 		BtcAddress:    btcAddress.String(),
 	}
 
@@ -536,8 +646,8 @@ func signCosmosAdr36(c *cli.Context) error {
 
 	response := SignatureResponse{
 		BabyAddress:   sdkAddress.String(),
-		BabySignature: base64.StdEncoding.EncodeToString(signature),
-		BabyPublicKey: base64.StdEncoding.EncodeToString(babyPubKey.Bytes()),
+		BabySignature: hex.EncodeToString(signature),
+		BabyPublicKey: hex.EncodeToString(babyPubKey.Bytes()),
 	}
 
 	helpers.PrintRespJSON(response)
